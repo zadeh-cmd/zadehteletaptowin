@@ -45,6 +45,7 @@ except ValueError:
 ROUND_PLAYER_COUNT = 10
 COUNTDOWN_SECONDS = 5
 TAP_DURATION_SECONDS = 10
+TIEBREAK_WINDOW = 5
 PENDING_PAYOUT_SECONDS = 180
 
 # -------------------- Logging --------------------
@@ -189,29 +190,23 @@ async def cmd_entergame(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handler_text_codes(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.user_data.get("awaiting_code"):
         return
-
     code = update.message.text.strip().upper()
     user = update.effective_user
     uid_int = user.id
     uid_str = str(uid_int)
-
     if code not in active_codes:
         await update.message.reply_text("❌ Invalid or not-generated code. Ask admin for a valid code.")
         context.user_data["awaiting_code"] = False
         return
-
     del active_codes[code]
     persist_codes()
     context.user_data["awaiting_code"] = False
-
     if uid_int in current_round_queue:
         await update.message.reply_text("ℹ️ You are already in the current queue.")
         return
-
     current_round_queue.append(uid_int)
     await update.message.reply_text("🔥 You're in the queue! Waiting for other players...")
     logger.info("User %s joined queue using code %s (queue size=%d)", uid_int, code, len(current_round_queue))
-
     async with round_lock:
         if not round_running and len(current_round_queue) >= ROUND_PLAYER_COUNT:
             app.create_task(start_round_from_queue())
@@ -239,7 +234,6 @@ async def cmd_claim(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if pending_payout.get("user_id") != user.id:
         await update.message.reply_text("❌ You are not the pending winner.")
         return
-
     await safe_send(ADMIN_ID, f"✅ Payout claim by {make_username_display(players[uid_str])}\nPhone: {pending_payout.get('phone')}\nTaps: {pending_payout.get('taps')}")
     await update.message.reply_text("✅ Claim received. Admin has been notified to process your payout. 🎉")
     pending_payout = None
@@ -251,7 +245,6 @@ async def cmd_generatecode(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id != ADMIN_ID:
         await update.message.reply_text("❌ You are not allowed to generate game codes.")
         return
-
     code = gen_code(8)
     while code in active_codes:
         code = gen_code(8)
@@ -276,7 +269,6 @@ async def cmd_forcestart(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if user.id != ADMIN_ID:
         await update.message.reply_text("❌ Only admin can force-start rounds.")
         return
-
     async with round_lock:
         if round_running:
             await update.message.reply_text("❌ A round is already running.")
@@ -290,7 +282,6 @@ async def cmd_forcestart(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # -------------------- Round orchestration --------------------
 async def start_round_from_queue():
     global round_running, round_start_time, pending_payout, round_message_map
-
     async with round_lock:
         if round_running:
             logger.info("start_round_from_queue called but round already running.")
@@ -300,25 +291,19 @@ async def start_round_from_queue():
         round_running = True
         round_message_map = {}
         logger.info("Starting round with players: %s", players_for_round)
-
-    # Countdown DMs
     for i in range(COUNTDOWN_SECONDS, 0, -1):
         for uid in players_for_round:
             pdata = players.get(str(uid))
             if pdata:
                 await safe_send(pdata["chat_id"], f"⏳ Game starting in *{i}*... Get ready! 🔥", parse_mode="Markdown")
         await asyncio.sleep(1)
-
-    # Reset counters
     for uid in players_for_round:
         pdata = players.get(str(uid))
         if pdata:
             pdata["taps"] = 0
             pdata["taps_first5"] = 0
     persist_players()
-
     round_start_time = time.time()
-
     for uid in players_for_round:
         pdata = players.get(str(uid))
         if pdata:
@@ -327,12 +312,10 @@ async def start_round_from_queue():
             msg = await safe_send(pdata["chat_id"], f"🚀 Start tapping! {TAP_DURATION_SECONDS} seconds — TAP FAST! 💥", reply_markup=markup)
             if isinstance(msg, Message):
                 round_message_map[uid] = msg.message_id
-
     await asyncio.sleep(TAP_DURATION_SECONDS)
     round_running = False
     snapshot_start = round_start_time
     round_start_time = None
-
     for uid, msg_id in list(round_message_map.items()):
         pdata = players.get(str(uid))
         if pdata:
@@ -340,12 +323,10 @@ async def start_round_from_queue():
                 await app.bot.edit_message_reply_markup(chat_id=pdata["chat_id"], message_id=msg_id, reply_markup=None)
             except Exception:
                 pass
-
     for uid in players_for_round:
         pdata = players.get(str(uid))
         if pdata:
             await safe_send(pdata["chat_id"], "⏱ Time's up! Tallying results... 🧾")
-
     participant_data = []
     for uid in players_for_round:
         pdata = players.get(str(uid))
@@ -359,9 +340,7 @@ async def start_round_from_queue():
             })
         else:
             participant_data.append({"user_id": uid, "display": f"User{uid}", "taps": 0, "taps_first5": 0, "phone": None})
-
     participant_data_sorted = sorted(participant_data, key=lambda x: (x["taps"], x["taps_first5"]), reverse=True)
-
     winner = None
     if participant_data_sorted:
         top_taps = participant_data_sorted[0]["taps"]
@@ -370,8 +349,6 @@ async def start_round_from_queue():
             winner = tied[0]
         else:
             winner = max(tied, key=lambda x: x["taps_first5"])
-
-    # Escape MarkdownV2 special chars
     lines = []
     rank = 1
     medals = ["🥇", "🥈", "🥉"]
@@ -381,18 +358,15 @@ async def start_round_from_queue():
         lines.append(f"{med} {display_safe} — {p['taps']} taps (first {p['taps_first5']}s)")
         rank += 1
     result_text = "🏁 ROUND RESULTS\n\n" + "\n".join(lines)
-
     if winner:
         winner_display_safe = escape_markdown(winner['display'], version=2)
         await safe_send(ADMIN_ID, f"🏆 Winner: {winner_display_safe}\n\n{result_text}", parse_mode="MarkdownV2")
     else:
         await safe_send(ADMIN_ID, f"No valid winner.\n\n{result_text}", parse_mode="MarkdownV2")
-
     for p in participant_data:
         pdata = players.get(str(p["user_id"]))
         if pdata:
             await safe_send(pdata["chat_id"], result_text, parse_mode="MarkdownV2")
-
     global pending_payout
     if winner:
         pending_payout = {
@@ -408,15 +382,6 @@ async def start_round_from_queue():
         app.create_task(pending_payout_expirer())
     else:
         pending_payout = None
-        persist_pending()
-
-    for p in participant_data:
-        uid_str = str(p["user_id"])
-        if uid_str in players:
-            players[uid_str]["taps"] = 0
-            players[uid_str]["taps_first5"] = 0
-    persist_players()
-    logger.info("Round finished; winner: %s", winner["display"] if winner else "None")
 
 # -------------------- Pending payout watcher --------------------
 async def pending_payout_expirer():
@@ -436,27 +401,38 @@ async def pending_payout_expirer():
 # -------------------- Tap callback --------------------
 async def callback_tap(update: Update, context: ContextTypes.DEFAULT_TYPE):
     global round_start_time
-
     query = update.callback_query
-    await query.answer()
     user = query.from_user
     uid_str = str(user.id)
-
     if uid_str not in players:
         await query.answer("You must register first with /register", show_alert=True)
         return
-
     if not round_running or round_start_time is None:
         await query.answer("Round not active!", show_alert=True)
         return
-
     elapsed = time.time() - round_start_time
     if elapsed > TAP_DURATION_SECONDS:
         await query.answer("Too late — round ended.", show_alert=True)
         return
-
     players[uid_str]["taps"] = int(players[uid_str].get("taps", 0)) + 1
     if elapsed <= 5:
         players[uid_str]["taps_first5"] = int(players[uid_str].get("taps_first5", 0)) + 1
     persist_players()
-    await query.answer(f"Tapped! Total taps: {players[uid_str]['taps
+    await query.answer(f"Tapped! Total taps: {players[uid_str]['taps']}", show_alert=False)
+
+# -------------------- Handlers registration --------------------
+app.add_handler(CommandHandler("start", cmd_start))
+app.add_handler(CommandHandler("help", cmd_help))
+app.add_handler(CommandHandler("register", cmd_register))
+app.add_handler(CommandHandler("entergame", cmd_entergame))
+app.add_handler(CommandHandler("claim", cmd_claim))
+app.add_handler(CommandHandler("generatecode", cmd_generatecode))
+app.add_handler(CommandHandler("listcodes", cmd_listcodes))
+app.add_handler(CommandHandler("forcestart", cmd_forcestart))
+app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handler_text_codes))
+app.add_handler(CallbackQueryHandler(callback_tap, pattern="tap"))
+
+# -------------------- Bot start --------------------
+if __name__ == "__main__":
+    logger.info("Bot starting...")
+    app.run_polling()
